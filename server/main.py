@@ -2,7 +2,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from typing import List, Optional
 from pydantic import BaseModel
-from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders
+from datetime import datetime, timedelta
+from mock_data import inventory_items, orders, demand_forecasts, backlog_items, spending_summary, monthly_spending, category_spending, recent_transactions, purchase_orders, restock_orders
+
+RESTOCK_LEAD_TIME_DAYS = 14
 
 app = FastAPI(title="Factory Inventory Management System")
 
@@ -119,6 +122,47 @@ class CreatePurchaseOrderRequest(BaseModel):
     unit_cost: float
     expected_delivery_date: str
     notes: Optional[str] = None
+
+class RestockRecommendation(BaseModel):
+    sku: str
+    name: str
+    quantity_on_hand: int
+    reorder_point: int
+    forecasted_demand: int
+    trend: str
+    recommended_quantity: int
+    unit_cost: float
+    line_total: float
+    is_critical: bool
+
+class RestockRecommendationsResponse(BaseModel):
+    recommendations: List[RestockRecommendation]
+    total_cost: float
+    budget: float
+    budget_remaining: float
+
+class RestockOrderItem(BaseModel):
+    sku: str
+    name: str
+    quantity: int
+    unit_cost: float
+    line_total: float
+
+class RestockOrder(BaseModel):
+    id: str
+    order_number: str
+    items: List[RestockOrderItem]
+    total_cost: float
+    budget: float
+    submitted_date: str
+    expected_delivery: str
+    lead_time_days: int
+    status: str
+
+class CreateRestockOrderRequest(BaseModel):
+    items: List[RestockOrderItem]
+    total_cost: float
+    budget: float
 
 # API endpoints
 @app.get("/")
@@ -303,6 +347,74 @@ def get_monthly_trends():
     result = list(months.values())
     result.sort(key=lambda x: x['month'])
     return result
+
+@app.get("/api/restock/recommendations", response_model=RestockRecommendationsResponse)
+def get_restock_recommendations(budget: float):
+    """Recommend items to restock within budget, urgency-first (critical items then by shortfall)."""
+    inv_by_sku = {item['sku']: item for item in inventory_items}
+
+    candidates = []
+    for forecast in demand_forecasts:
+        inv = inv_by_sku.get(forecast['item_sku'])
+        if not inv:
+            continue
+        shortfall = forecast['forecasted_demand'] - inv['quantity_on_hand']
+        if shortfall <= 0:
+            continue
+        is_critical = inv['quantity_on_hand'] <= inv['reorder_point']
+        line_total = round(shortfall * inv['unit_cost'], 2)
+        candidates.append({
+            'sku': inv['sku'],
+            'name': inv['name'],
+            'quantity_on_hand': inv['quantity_on_hand'],
+            'reorder_point': inv['reorder_point'],
+            'forecasted_demand': forecast['forecasted_demand'],
+            'trend': forecast['trend'],
+            'recommended_quantity': shortfall,
+            'unit_cost': inv['unit_cost'],
+            'line_total': line_total,
+            'is_critical': is_critical,
+        })
+
+    candidates.sort(key=lambda c: (not c['is_critical'], -c['recommended_quantity']))
+
+    selected = []
+    running_total = 0.0
+    for c in candidates:
+        if running_total + c['line_total'] <= budget:
+            selected.append(c)
+            running_total += c['line_total']
+
+    return {
+        'recommendations': selected,
+        'total_cost': round(running_total, 2),
+        'budget': budget,
+        'budget_remaining': round(budget - running_total, 2),
+    }
+
+@app.post("/api/restock/orders", response_model=RestockOrder)
+def create_restock_order(request: CreateRestockOrderRequest):
+    """Submit a restock order. Stored in memory; resets on server restart."""
+    now = datetime.now()
+    order_id = str(len(restock_orders) + 1)
+    order = {
+        'id': order_id,
+        'order_number': f"RST-2025-{len(restock_orders) + 1:04d}",
+        'items': [item.model_dump() for item in request.items],
+        'total_cost': request.total_cost,
+        'budget': request.budget,
+        'submitted_date': now.isoformat(),
+        'expected_delivery': (now + timedelta(days=RESTOCK_LEAD_TIME_DAYS)).isoformat(),
+        'lead_time_days': RESTOCK_LEAD_TIME_DAYS,
+        'status': 'Submitted',
+    }
+    restock_orders.append(order)
+    return order
+
+@app.get("/api/restock/orders", response_model=List[RestockOrder])
+def get_restock_orders():
+    """Get all submitted restock orders."""
+    return restock_orders
 
 if __name__ == "__main__":
     import uvicorn
